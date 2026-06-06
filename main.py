@@ -36,11 +36,527 @@ from coupon.optimizer import budget_optimize, split_coupons
 from output.display import print_results, print_coupons
 from output.xlsx_export import export_xlsx
 from memory.st_memory import STMemory, get_memory
-from modules.cache_ops import _clear_cache, _download_past_seasons_menu, _show_cache_status
-from modules.results_sync import _auto_results_from_api, _auto_results_from_csv, _sync_results_from_docx
-from modules.analysis_menu import (_run_test_center, _run_backtest, _run_backtest_toplu,
-                                   _run_lprm_report, _run_lprm_report_toplu,
-                                   _run_ab_test, _run_scenario_analysis)
+try:
+    from modules.cache_ops import _clear_cache, _download_past_seasons_menu, _show_cache_status
+    from modules.results_sync import _auto_results_from_api, _auto_results_from_csv, _sync_results_from_docx
+    from modules.analysis_menu import (_run_test_center, _run_backtest, _run_backtest_toplu,
+                                       _run_lprm_report, _run_lprm_report_toplu,
+                                       _run_ab_test, _run_scenario_analysis)
+except ImportError:
+    # ── INLINE FALLBACKS — modules/ dizini yoksa main.py içinden çalışır ──
+
+    def _clear_cache():
+        if not os.path.exists(FD_CACHE_DIR):
+            print("  Cache klasoru yok.")
+            return
+        count = 0
+        for f in os.listdir(FD_CACHE_DIR):
+            if f.endswith(".pkl") or f.endswith(".json"):
+                try:
+                    os.remove(os.path.join(FD_CACHE_DIR, f))
+                    count += 1
+                except (OSError, IOError, ValueError, TypeError, KeyError):
+                    pass
+        print(f"  {count} cache dosyasi silindi.")
+
+    def _show_cache_status():
+        print("\n  Cache Durumu (fd_cache/):")
+        if not os.path.exists(FD_CACHE_DIR):
+            print("  Bos — henuz veri indirilmemis.")
+            return
+        files = sorted(os.listdir(FD_CACHE_DIR))
+        total_size = 0
+        for f in files:
+            path = os.path.join(FD_CACHE_DIR, f)
+            size = os.path.getsize(path)
+            total_size += size
+            age_h = (time.time() - os.path.getmtime(path)) / 3600
+            age_str = f"{age_h:.0f}sa" if age_h < 48 else f"{age_h/24:.0f}g"
+            print(f"    {f:<30} {size//1024:>3}KB  {age_str}")
+        print(f"\n  Toplam: {len(files)} dosya, {total_size//1024}KB")
+
+    # ── Menü 6→3: Geçmiş sezon indirme menüsü ─────────────────────────────
+    def _download_past_seasons_menu():
+        print("\n" + "═"*58)
+        print("  GECMIS SEZON VERILERI INDIR")
+        print("  Oran karsilastirmasi icin 3 sezon gerekli")
+        print("═"*58)
+        all_leagues = list(LEAGUES.keys())
+        print(f"\n  Ligler: {', '.join(all_leagues)}")
+        print(f"  Sezonlar: {', '.join(PAST_SEASONS)}")
+        total = len(all_leagues) * len(PAST_SEASONS)
+        print(f"\n  Toplam {total} CSV indirilecek (~{total*60}KB)")
+        print(f"  VPN aktif olmali!")
+        print(f"\n  Devam? (Enter=Evet, q=Iptal): ", end="", flush=True)
+        try:
+            ans = input().strip().lower()[:1]
+            if ans == "q":
+                print("  Iptal.")
+                return
+        except (OSError, IOError, ValueError, TypeError, KeyError):
+            pass
+        ok = 0; fail = 0; skip = 0
+        for code in all_leagues:
+            print(f"\n  [{code}] {LEAGUES.get(code, code)}")
+            for season in PAST_SEASONS:
+                cache = _cache_path(f"{code}_{season}.pkl")
+                if _cache_fresh(cache, FD_CACHE_TTL_H * 30):
+                    df_c = _load_pkl(cache)
+                    if df_c is not None:
+                        print(f"    {season}: cache mevcut ({len(df_c)} mac) ✓")
+                        skip += 1
+                        continue
+                df_c = download_league(code, season)
+                if df_c is not None and not df_c.empty:
+                    ok += 1
+                else:
+                    fail += 1
+        print(f"\n{'═'*58}")
+        print(f"  Tamamlandi: ✓ {ok} / ⊙ {skip}" + (f" / ✗ {fail}" if fail else ""))
+        print(f"  Veriler fd_cache/ klasorunde saklandı.")
+        print("═"*58)
+
+    # ── API'dan otomatik sonuç çekme ────────────────────────────────────────
+    def _auto_results_from_api(mem) -> int:
+        print("\n  [API-Football] Sonuclar cekiliyor...")
+        try:
+            from data.api_football import APIFootball, LEAGUE_ID_MAP, SEASON_MAP
+            api = APIFootball()
+            if not api.key:
+                print("  ✗ API_KEY eksik — api_football_plan.md'deki adimlari takip et")
+                return 0
+        except ImportError:
+            print("  ✗ api_football.py bulunamadi")
+            return 0
+        log = mem._load_pred_log()
+        total_matched = 0
+
+        def _api_wk_key(item):
+            wm = re.match(r'ST(\d+)-(\d+)', item[0])
+            return (int(wm.group(2)), int(wm.group(1))) if wm else (0, 0)
+
+        for week_id, wd in sorted(log.items(), key=_api_wk_key, reverse=True):
+            matches = wd.get("matches", [])
+            unresolved = [m for m in matches if not m.get("actual")]
+            if not unresolved:
+                continue
+            print(f"\n  [{week_id}] {len(unresolved)} sonuc bekleniyor...")
+            from datetime import datetime as _dt2, timedelta as _td2
+            today = _dt2.now()
+            dates = set()
+            for delta in range(14):
+                d = today - _td2(days=delta)
+                if d.weekday() in (5, 6):
+                    dates.add(d.strftime("%Y-%m-%d"))
+            api_results = {}
+            for league_code, league_id in LEAGUE_ID_MAP.items():
+                season_yr = SEASON_MAP.get(ST_SEASON_TAG, 2025)
+                for date_str in sorted(dates, reverse=True)[:7]:
+                    fixtures = api.fixtures(league_id, season_yr, date=date_str, status="FT")
+                    for f in fixtures:
+                        if f["home_score"] is None:
+                            continue
+                        h, a = f["home_score"], f["away_score"]
+                        result = "H" if h > a else ("D" if h == a else "A")
+                        api_results[f"{f['home'].upper()}_{f['away'].upper()}"] = result
+                        api_results[f"{f['home_raw'].upper()}_{f['away_raw'].upper()}"] = result
+            week_matched = 0
+            for m in unresolved:
+                home = str(m.get("home", m.get("fd_home", ""))).upper().strip()
+                away = str(m.get("away", m.get("fd_away", ""))).upper().strip()
+                key = f"{home}_{away}"
+                result = api_results.get(key)
+                if not result:
+                    home3 = home[:4]; away3 = away[:4]
+                    for k, v in api_results.items():
+                        parts = k.split("_")
+                        if len(parts) == 2 and parts[0][:4] == home3 and parts[1][:4] == away3:
+                            result = v; break
+                if result:
+                    m["actual"] = result
+                    week_matched += 1; total_matched += 1
+                    ftr_str = {"H": "1 (Ev)", "D": "X (Bera)", "A": "2 (Dep)"}
+                    print(f"    ✓ #{m.get('no','?')} "
+                          f"{m.get('home','?')[:12]} vs {m.get('away','?')[:12]}"
+                          f" → {ftr_str.get(result, result)}")
+            if week_matched > 0:
+                print(f"  [{week_id}] {week_matched} sonuc eslesti")
+                log[week_id]["matches"] = matches
+                mem._save_pred_log(log)
+                mem._learn_from_week(week_id, matches)
+                mem.save()
+        if total_matched == 0:
+            print("  ⚠ Eslesen sonuc bulunamadi")
+            print("  → Manuel giris icin Menu 2 kullan")
+        return total_matched
+
+    def _auto_results_from_csv(mem) -> int:
+        print("  _auto_results_from_csv: modules/results_sync.py gerekli")
+        return 0
+
+    def _sync_results_from_docx(weeks, mem) -> int:
+        return 0
+
+    def _run_backtest_toplu():
+        print("  Toplu backtest: modules/analysis_menu.py gerekli")
+
+    def _run_lprm_report():
+        print("  LPRM raporu: modules/analysis_menu.py gerekli")
+
+    def _run_lprm_report_toplu():
+        print("  LPRM toplu raporu: modules/analysis_menu.py gerekli")
+
+    # ── Menü 7: Test & Analiz Merkezi ──────────────────────────────────────
+    def _run_test_center(mem=None):
+        R = "\033[0m"; B = "\033[1m"
+        C = "\033[36m"; G = "\033[32m"; DM = "\033[2m"
+        while True:
+            print()
+            print(f"\n  {C}{B}── TEST & ANALIZ MERKEZI {'─'*18}{R}")
+            print(f"  {G}{B}1{R}  Backtest        {DM}(gecmis sezon){R}")
+            print(f"  {G}{B}2{R}  Performans      {DM}(ST37+ KAOS/BANKO){R}")
+            print(f"  {G}{B}3{R}  Senaryo         {DM}(What-If analizi){R}")
+            print(f"  {C}{B}4{R}  Performans Rontgeni  {DM}(derinlemesine analiz){R}")
+            print(f"  {C}{B}5{R}  CLV Tracker          {DM}(kapanis cizgisi degeri){R}")
+            print(f"  {G}{B}6{R}  Model Saglik Paneli  {DM}(genel sistem sagligi){R}")
+            print(f"  {C}{'─'*40}{R}")
+            print(f"\n  {DM}Secim (1-6, M=Geri):{R} ", end="", flush=True)
+            try:
+                ch = input().strip()[:1].upper()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if ch in ("M", ""):
+                break
+            if ch == "1":
+                _run_backtest()
+            elif ch == "2":
+                import importlib.util as _ilu
+                _ap = os.path.normpath(os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "analiz.py"))
+                if not os.path.exists(_ap):
+                    print("  analiz.py bulunamadi.")
+                else:
+                    _sp = _ilu.spec_from_file_location("analiz", _ap)
+                    _mmod = _ilu.module_from_spec(_sp)
+                    _sp.loader.exec_module(_mmod)
+                    if hasattr(_mmod, "main"): _mmod.main()
+            elif ch == "3":
+                _run_scenario_analysis()
+            elif ch == "4":
+                try:
+                    from memory.performance_xray import run_xray
+                    _xmem = mem if mem is not None else get_memory()
+                    run_xray(_xmem)
+                except Exception as _xe:
+                    print(f"  Rontgen hatasi: {_xe}")
+            elif ch == "5":
+                try:
+                    from memory.clv_tracker import get_clv_tracker
+                    get_clv_tracker().print_summary()
+                except Exception as _ce:
+                    print(f"  CLV Tracker hatasi: {_ce}")
+            elif ch == "6":
+                try:
+                    from memory.model_health import run_health_check
+                    _hmem = mem if mem is not None else get_memory()
+                    run_health_check(_hmem)
+                except Exception as _he:
+                    print(f"  Saglik paneli hatasi: {_he}")
+            print(f"\n  {DM}{'─'*38}{R}")
+            input("  Enter ile geri don...")
+
+    # ── Menü 7→1: Geçmiş sezon backtest ────────────────────────────────────
+    def _run_backtest():
+        print("\n" + "═"*62)
+        print("  BACKTEST — GECMIS SEZON ANALIZI")
+        print("═"*62)
+        print("\n  Analiz modu secin:")
+        print("    1. Tek Lig/Sezon Backtest")
+        print("    2. Toplu Analiz  (tum ligler, tum sezonlar)")
+        print("    3. LPRM Raporu   (LPRM on/off karsilastirma)")
+        print("    4. A/B Test      (Devret & Pozisyon ON/OFF)")
+        print("  Secim (1-4, Enter=1): ", end="", flush=True)
+        try:
+            mode = input().strip()[:1]
+            if mode not in ("1","2","3","4"): mode = "1"
+        except Exception:
+            mode = "1"
+        if mode == "2": _run_backtest_toplu(); return
+        if mode == "3": _run_lprm_report(); return
+        if mode == "4": _run_ab_test(); return
+
+        LIG_MAP = {"1":("T1","Super Lig"),"2":("E0","Premier League"),
+                   "3":("D1","Bundesliga"),"4":("SP1","La Liga"),
+                   "5":("I1","Serie A"),"6":("F1","Ligue 1")}
+        print("\n  Lig secin:")
+        for k, (code, name) in LIG_MAP.items():
+            print(f"    {k}. {name} ({code})")
+        print("  Secim (1-6, Enter=1): ", end="", flush=True)
+        try:
+            lig_sel = input().strip()[:1]
+            if lig_sel not in LIG_MAP: lig_sel = "1"
+        except Exception:
+            lig_sel = "1"
+        lig_code, lig_name = LIG_MAP[lig_sel]
+
+        def _lbl(code): return f"20{code[:2]}-{code[2:]}"
+        past = PAST_SEASONS
+        SEASONS = {"1": past[1] if len(past) > 1 else past[0],
+                   "2": past[0], "3": CURRENT_SEASON}
+        print(f"\n  Sezon secin:")
+        for k, s in SEASONS.items():
+            print(f"    {k}. {_lbl(s)}")
+        print("  Secim (1-3, Enter=2): ", end="", flush=True)
+        try:
+            s_sel = input().strip()[:1]
+            if s_sel not in SEASONS: s_sel = "2"
+        except Exception:
+            s_sel = "2"
+        season = SEASONS[s_sel]
+
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fd_cache")
+        csv_path = os.path.join(base, f"{lig_code}_{season}.csv")
+        if not os.path.exists(csv_path):
+            print(f"\n  ⚠ Dosya yok: {csv_path}")
+            print(f"  Menu 6 ile indirin.")
+            return
+        try:
+            df_bt = pd.read_csv(csv_path, on_bad_lines='skip')
+        except Exception as e:
+            print(f"\n  ⚠ CSV okunamadi: {e}"); return
+        if "FTR" not in df_bt.columns:
+            print("  ⚠ FTR sutunu yok."); return
+        df_bt = df_bt.dropna(subset=["FTR"])
+        df_bt = df_bt[df_bt["FTR"].isin(["H","D","A"])]
+        total = len(df_bt)
+        if total < 50:
+            print(f"  ⚠ Yeterli mac yok ({total})."); return
+
+        N_SIM = 1000
+        print(f"\n  {lig_name} {season[:2]}/{season[2:]} — {total} mac analiz ediliyor...")
+        correct = 0; n = 0; brier_sum = 0.0
+        cm = {"H":{"H":0,"D":0,"A":0},"D":{"H":0,"D":0,"A":0},"A":{"H":0,"D":0,"A":0}}
+        team_gf = {}; team_ga = {}; alpha = 0.2; lg_avg = 1.30
+        bar_step = max(1, total//20)
+        odd_cols = {"1":None,"X":None,"2":None}
+        for c in ["B365H","PSH","BbAvH","AvgH"]:
+            if c in df_bt.columns: odd_cols["1"]=c; break
+        for c in ["B365D","PSD","BbAvD","AvgD"]:
+            if c in df_bt.columns: odd_cols["X"]=c; break
+        for c in ["B365A","PSA","BbAvA","AvgA"]:
+            if c in df_bt.columns: odd_cols["2"]=c; break
+
+        _orig = CFG.get("simulations", 50000); CFG["simulations"] = N_SIM
+        for idx, row in df_bt.iterrows():
+            actual = row["FTR"]
+            home = str(row.get("HomeTeam","?")); away = str(row.get("AwayTeam","?"))
+            gf_h = team_gf.get(home+"_h",1.4); ga_h = team_ga.get(home+"_h",1.1)
+            gf_a = team_gf.get(away+"_a",1.1); ga_a = team_ga.get(away+"_a",1.4)
+            lam_h = max(0.25,min(3.0,(gf_h*ga_a/lg_avg)*1.10))
+            lam_a = max(0.25,min(3.0,(gf_a*ga_h/lg_avg)*0.95))
+            try: p1,px,p2 = monte_carlo(lam_h, lam_a)
+            except Exception: p1,px,p2 = 0.45,0.27,0.28
+            if odd_cols["1"]:
+                try:
+                    o1=float(row[odd_cols["1"]]); ox=float(row[odd_cols["X"]]); o2=float(row[odd_cols["2"]])
+                    tot=1/o1+1/ox+1/o2
+                    p1=p1*0.65+(1/o1/tot)*0.35; px=px*0.65+(1/ox/tot)*0.35; p2=p2*0.65+(1/o2/tot)*0.35
+                except Exception: pass
+            pred_ftr = "H" if p1==max(p1,px,p2) else ("D" if px>p2 else "A")
+            if pred_ftr==actual: correct+=1
+            if pred_ftr in cm.get(actual,{}): cm[actual][pred_ftr]+=1
+            o_h=1.0 if actual=="H" else 0.0; o_d=1.0 if actual=="D" else 0.0; o_a=1.0 if actual=="A" else 0.0
+            brier_sum+=((p1-o_h)**2+(px-o_d)**2+(p2-o_a)**2)/3
+            try:
+                fthg=float(row.get("FTHG",0)); ftag=float(row.get("FTAG",0))
+                team_gf[home+"_h"]=gf_h*(1-alpha)+fthg*alpha; team_ga[home+"_h"]=ga_h*(1-alpha)+ftag*alpha
+                team_gf[away+"_a"]=gf_a*(1-alpha)+ftag*alpha; team_ga[away+"_a"]=ga_a*(1-alpha)+fthg*alpha
+            except Exception: pass
+            n+=1
+            done = idx-df_bt.index[0]+1
+            if done%bar_step==0 or done==total:
+                pct=done/total; bar="█"*int(pct*30)+"░"*(30-int(pct*30))
+                print(f"\r  [{bar}] %{pct*100:.0f}  ({done}/{total})", end="", flush=True)
+        CFG["simulations"] = _orig
+        print()
+        acc = correct/n if n else 0; brier = brier_sum/n if n else 0
+        classes = {"H":"Ev(1)","D":"Bera(X)","A":"Dep(2)"}
+        f1s = {}
+        for cls in ["H","D","A"]:
+            tp=cm[cls][cls]; fp=sum(cm[aa][cls] for aa in cm if aa!=cls); fn=sum(cm[cls][pp] for pp in cm[cls] if pp!=cls)
+            prec=tp/(tp+fp) if tp+fp else 0; rec=tp/(tp+fn) if tp+fn else 0
+            f1s[cls]=round(2*prec*rec/(prec+rec) if prec+rec else 0,3)
+        macro_f1=sum(f1s.values())/3
+        mem2=get_memory(); tot_m=mem2.mem.get("total_preds",0); cor_m=mem2.mem.get("correct",0)
+        acc_m=cor_m/tot_m if tot_m else 0
+        print(f"\n{'═'*62}")
+        print(f"  BACKTEST — {lig_name} {season[:2]}/{season[2:]}")
+        print(f"{'═'*62}")
+        print(f"  Analiz edilen : {n} mac")
+        print(f"  Dogruluk      : %{acc*100:.1f} ({correct}/{n})")
+        print(f"  Brier Skoru   : {brier:.4f}  {'✅' if brier<0.22 else '⚠'}")
+        print(f"  Macro F1      : {macro_f1:.3f}")
+        print(f"\n  Sinif Bazli F1:")
+        for cls, cname in classes.items():
+            bar="█"*int(f1s[cls]*20)+"░"*(20-int(f1s[cls]*20))
+            print(f"    {cname:<8} [{bar}]  {f1s[cls]:.3f}")
+        if tot_m:
+            wh=mem2.mem.get("weekly_history",[])
+            b_vals=[h["brier"] for h in wh if h.get("brier")]
+            b_mem=sum(b_vals)/len(b_vals) if b_vals else None
+            print(f"\n  Hafiza ({tot_m} mac): %{acc_m*100:.1f}"+(f"  Brier={b_mem:.3f}" if b_mem else ""))
+        print(f"{'═'*62}")
+
+    # ── Menü 7→1→4: A/B Test ───────────────────────────────────────────────
+    def _run_ab_test():
+        print("\n" + "═"*62)
+        print("  A/B TEST — Devret & Pozisyon ON/OFF Karsilastirma")
+        print("═"*62)
+        try:
+            from tools.ab_test import MatchInput, run_ab_test, print_ab_report, Prediction
+        except ImportError:
+            try:
+                _tools = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools")
+                sys.path.insert(0, _tools)
+                from ab_test import MatchInput, run_ab_test, print_ab_report, Prediction
+            except ImportError:
+                print("  ✗ ab_test.py bulunamadi → tools/ klasorune koy")
+                return
+        print("\n  Hangi haftadan itibaren? (orn: ST41-2526, bos=tumu): ", end="", flush=True)
+        try:
+            from_week = input().strip() or None
+        except Exception:
+            from_week = None
+        base_dir  = os.path.dirname(os.path.abspath(__file__))
+        pred_path = os.path.join(base_dir, "st_predictions.json")
+        mem_path  = os.path.join(base_dir, "st_memory.json")
+        if not os.path.exists(pred_path):
+            print(f"  ✗ {pred_path} bulunamadi"); return
+        print("\n[1] Maclar yukleniyor...")
+        with open(pred_path, encoding="utf-8") as f:
+            preds = json.load(f)
+        mem_data = {}
+        if os.path.exists(mem_path):
+            with open(mem_path, encoding="utf-8") as f:
+                mem_data = json.load(f)
+        devret_weeks = set()
+        for h in mem_data.get("weekly_history", []):
+            if h.get("prize_15_prev") == "Devretti":
+                devret_weeks.add(h.get("week",""))
+        def _wk_num(wid):
+            wm = re.match(r'ST(\d+)-(\d+)', wid)
+            return (int(wm.group(2)), int(wm.group(1))) if wm else (0, 0)
+        matches_ab = []
+        for week_id, wdata in preds.items():
+            if from_week and _wk_num(week_id) < _wk_num(from_week):
+                continue
+            week_matches = wdata.get("matches", [])
+            if not any(m.get("actual") for m in week_matches):
+                continue
+            is_devret = week_id in devret_weeks
+            for m in week_matches:
+                actual = m.get("actual")
+                if not actual: continue
+                result = {"H":"1","D":"X","A":"2","0":"X"}.get(actual, actual)
+                matches_ab.append(MatchInput(
+                    match_id  = f"{week_id}-M{m.get('no',0)}",
+                    position  = m.get("no", 1),
+                    home_team = m.get("home","?"),
+                    away_team = m.get("away","?"),
+                    odds_home = float(m.get("odds",{}).get("1") or 2.0),
+                    odds_draw = float(m.get("odds",{}).get("X") or 3.3),
+                    odds_away = float(m.get("odds",{}).get("2") or 3.8),
+                    result    = result,
+                    week_id   = week_id,
+                    is_devret = is_devret,
+                ))
+        n_ab = len(matches_ab)
+        if n_ab < 30:
+            print(f"  ⚠ Yeterli mac yok: {n_ab} (min 30 gerekli)"); return
+        n_devret = sum(1 for m in matches_ab if m.is_devret)
+        print(f"  ✓ {n_ab} mac | Devret: {n_devret}")
+        if n_ab < 100:
+            print(f"  ⚠ UYARI: {n_ab} mac istatistiksel guvenilirlik icin yetersiz.")
+        def predict_fn(match, devret_on, pos_on):
+            try:
+                from model.suggest import suggest as _sug
+                eps = 1e-6
+                o1=max(match.odds_home,eps); ox=max(match.odds_draw,eps); o2=max(match.odds_away,eps)
+                raw1,rawx,raw2=1/o1,1/ox,1/o2; tot=raw1+rawx+raw2
+                p1,px,p2=raw1/tot,rawx/tot,raw2/tot
+                if pos_on and match.position:
+                    try:
+                        from model.position_bias import get_position_bias
+                        pb=get_position_bias(match.position)
+                        if pb:
+                            p1+=pb.get("1",0.0); px+=pb.get("X",0.0); p2+=pb.get("2",0.0)
+                            t=p1+px+p2
+                            if t>0: p1,px,p2=p1/t,px/t,p2/t
+                    except Exception: pass
+                if devret_on and match.is_devret:
+                    px+=0.04; t=p1+px+p2
+                    if t>0: p1,px,p2=p1/t,px/t,p2/t
+                _pos_kw = match.position if pos_on else None
+                try:
+                    label,_,_=_sug(p1,px,p2,position=_pos_kw,
+                                   lprm_draw_signal=(devret_on and match.is_devret))
+                except Exception:
+                    best=max(p1,px,p2)
+                    label="TEK   1" if best==p1 else ("TEK   X" if best==px else "TEK   2")
+                return Prediction(p1=p1,px=px,p2=p2,suggestion=label)
+            except Exception:
+                return Prediction(p1=0.45,px=0.27,p2=0.28,suggestion="TEK   1")
+        print("\n[2] 4 senaryo test ediliyor...")
+        results_ab = run_ab_test(matches_ab, predict_fn)
+        print_ab_report(results_ab)
+
+    # ── Menü 7→3: What-If Senaryo Analizi ─────────────────────────────────
+    def _run_scenario_analysis():
+        try:
+            from model.monte_carlo import poisson_analytical
+        except ImportError:
+            print("  Hata: monte_carlo yuklenemedi"); return
+        print("\n" + "="*60)
+        print("  SENARYO ANALIZI - What-If")
+        print("="*60)
+        print("  Ev takim (fd adi): ", end="", flush=True)
+        home_sc = input().strip()
+        print("  Dep takim: ", end="", flush=True)
+        away_sc = input().strip()
+        if not home_sc or not away_sc: return
+        print("  Lig kodu (Enter=T1): ", end="", flush=True)
+        lg_sc = input().strip() or "T1"
+        try:
+            df_sc = download_league(lg_sc, ST_SEASON_TAG)
+            if isinstance(df_sc, tuple): df_sc = df_sc[0]
+            st_sc, avg_sc, _ = build_team_stats(df_sc)
+            lam_h_sc, lam_a_sc = calc_lambda(home_sc, away_sc, st_sc, avg_sc,
+                                              None, None, league_code=lg_sc)
+        except Exception:
+            print("  Manuel giris:")
+            lam_h_sc = float(input("  lam_h (1.5): ").strip() or "1.5")
+            lam_a_sc = float(input("  lam_a (1.2): ").strip() or "1.2")
+        def _s(lh, la, tag):
+            p1,px,p2=poisson_analytical(lh,la,league_code=lg_sc)
+            print(f"  {tag:<30}  1={p1*100:.1f}%  X={px*100:.1f}%  2={p2*100:.1f}%  lH={lh:.2f} lA={la:.2f}")
+        print("\n  Senaryolar:")
+        _s(lam_h_sc, lam_a_sc, "BAZ (mevcut)")
+        _s(lam_h_sc*0.88, lam_a_sc, "Ev yildiz eksik (-%12)")
+        _s(lam_h_sc, lam_a_sc*0.88, "Dep yildiz eksik (-%12)")
+        _s(lam_h_sc/1.08, lam_a_sc, "Tarafsiz saha")
+        p1b,pxb,p2b=poisson_analytical(lam_h_sc,lam_a_sc,league_code=lg_sc)
+        pxd=min(0.55,pxb*1.30); norm=p1b+pxd+p2b
+        print(f"  {'Devret (X +%30)':<30}  1={p1b/norm*100:.1f}%  X={pxd/norm*100:.1f}%  2={p2b/norm*100:.1f}%")
+        print("\n  En Olasilikh Skorlar:")
+        def pmf_fn(lam, k): return (lam**k * math.exp(-lam)) / math.factorial(k)
+        sc_list=sorted([(pmf_fn(lam_h_sc,h)*pmf_fn(lam_a_sc,a)*100,h,a)
+                        for h in range(6) for a in range(6)],reverse=True)
+        for prob,h,a in sc_list[:8]:
+            res="1" if h>a else ("X" if h==a else "2")
+            bar=chr(9608)*int(prob/2)
+            print(f"    {h}-{a} ({res})  %{prob:4.1f}  {bar}")
+        print()
+        input("  Enter ile devam...")
 
 # BÖLÜM 11 — ANA PIPELINE
 # ═══════════════════════════════════════════════════════════════
