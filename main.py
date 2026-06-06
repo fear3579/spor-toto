@@ -723,7 +723,7 @@ def _run_ml_training(mem):
     Menü B — ML Model Eğitimi.
 
     Kaynak 1: st_predictions.json (mevcut hafta verileri)
-    Kaynak 2: training/ klasörü (3 sezon, ağırlıklı, 30 özellik)
+    Kaynak 2: training/ klasörü (3 sezon, ağırlıklı, 15 özellik)
     """
     import json, os
     from model.ml_engine import AugurML, FEATURE_NAMES, MIN_SAMPLES_GB
@@ -761,7 +761,7 @@ def _run_ml_training(mem):
     except Exception as e:
         print(f"  ✗ st_predictions.json okunamadı: {e}")
 
-    # ── Kaynak 2: training/ klasörü (ağırlıklı, 30 özellik) ──
+    # ── Kaynak 2: training/ klasörü (ağırlıklı, 15 özellik) ──
     weights_list = []
     try:
         from tools.training_loader import TrainingLoader

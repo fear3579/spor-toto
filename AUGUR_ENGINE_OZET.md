@@ -51,7 +51,7 @@ SPOR TOTO/ (268 dosya)
 │   └── season_transition.py ← Ağustos sezon geçiş scripti
 │
 ├── tools/
-│   ├── training_loader.py   ← 28 feature ML veri yükleyici
+│   ├── training_loader.py   ← 15 feature ML veri yükleyici
 │   ├── ab_test.py           ← A/B test çekirdek
 │   ├── run_ab_test.py       ← 4 senaryo (devret×pozisyon)
 │   └── elo_fetcher.py       ← ClubElo indirici
@@ -222,7 +222,7 @@ POS_BIAS = {
 ```
 LR×0.15 + GB×0.45 + MLP×0.20 + RF×0.20
 + Platt kalibrasyonu (%30 blend)
-28 feature → P(1/X/2)
+15 feature → P(1/X/2)
 ```
 
 ### K9 — Sakatlık/Ceza (API)
@@ -251,19 +251,17 @@ return max(lam_h, 0.15), max(lam_a, 0.15)
 
 ### AugurML — 4'lü Ensemble
 
-#### 28 Feature Listesi
+#### 15 Feature Listesi (Haziran 2026: 28→15, korelasyonlu gruplar birleştirildi)
 
 | Grup | Feature'lar |
 |------|------------|
-| B365 oranları (3) | p1_b365, px_b365, p2_b365 |
-| Pinnacle oranları (3) | p1_pin, px_pin, p2_pin |
-| Piyasa ortalaması (3) | p1_avg, px_avg, p2_avg |
-| Yayılım (1) | odds_spread |
-| Line movement (3) | lm_h, lm_d, lm_a |
+| Oran sinyali (4) | p1_pin, px_pin, p2_pin, odds_spread |
 | Lambda (3) | lam_h, lam_a, lam_diff |
-| Gol oranı (2) | over25_prob, under25_prob |
-| Form (5) | form_h_gf, form_h_ga, form_a_gf, form_a_ga, form_diff |
-| Bağlam (5) | season_week, is_home_fav, draw_rate_lig, pos_diff_norm, ah_line |
+| Gol oranı (1) | over25_prob |
+| Form (1) | form_diff |
+| Line movement (2) | lm_h, lm_d |
+| Bağlam (3) | season_week, is_home_fav, draw_rate_lig |
+| Pozisyon (1) | pos_diff_norm |
 
 #### Modeller
 
@@ -275,12 +273,12 @@ LR — Logistik Regresyon
 
 GB — Gradient Boosting
   CV doğruluk: %53.4
-  100 ağaç, max_depth=4, learning_rate=0.10
-  Top-5 feature: p1_pin, p2_pin, p1_avg, p2_avg, pos_diff_norm
+  60 ağaç, max_depth=3, learning_rate=0.12, subsample=0.80 (Android RAM uyumlu)
+  Top-5 feature: p1_pin, p2_pin, odds_spread, lam_diff, pos_diff_norm
 
 MLP — Yapay Sinir Ağı (YSA)
   CV doğruluk: %54.3
-  Mimari: 28→32→16→3 (ReLU, Adam)
+  Mimari: 15→32→16→3 (ReLU, Adam)
   early_stopping=True, validation_fraction=0.15
 
 RF — Random Forest (YENİ)
@@ -793,7 +791,7 @@ enrich_training.py (yazılacak):
   10,000 maç × /fixture_statistics → xG
   10,000 maç × /teams/statistics → btts, win_rate
   20,000 API isteği → 3 günde tamamlanır
-  Sonuç: 28 → 37 feature
+  Sonuç: 15 → 24+ feature
 
 Beklenen iyileşme:
   Brier: 0.1981 → ~0.1910
