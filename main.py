@@ -233,13 +233,13 @@ except ImportError:
                 import importlib.util as _ilu
                 _ap = os.path.normpath(os.path.join(
                     os.path.dirname(os.path.abspath(__file__)), "analiz.py"))
-                if not os.path.exists(_ap):
-                    print("  analiz.py bulunamadi.")
-                else:
+                if os.path.exists(_ap):
                     _sp = _ilu.spec_from_file_location("analiz", _ap)
                     _mmod = _ilu.module_from_spec(_sp)
                     _sp.loader.exec_module(_mmod)
                     if hasattr(_mmod, "main"): _mmod.main()
+                else:
+                    _analiz_main()
             elif ch == "3":
                 _run_scenario_analysis()
             elif ch == "4":
@@ -560,6 +560,192 @@ except ImportError:
 
 # BÖLÜM 11 — ANA PIPELINE
 # ═══════════════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════════════════════════
+# PERFORMANS ANALİZİ — analiz.py inline (Menü 7→2 / Menü A)
+# ═══════════════════════════════════════════════════════════════
+
+def _analiz_main():
+    """Menü 7→2 / Menü A — Performans analizi (analiz.py inline)."""
+    import re as _re_a
+
+    _PRED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "st_predictions.json")
+    _FTR_MAP_A = {"H": "1", "D": "X", "A": "2", "0": "X"}
+
+    def _load_preds():
+        if not os.path.exists(_PRED_FILE):
+            return {}
+        try:
+            return json.load(open(_PRED_FILE, encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _week_metrics(matches):
+        kupon_c=0; kupon_t=0
+        argmax_c=0; argmax_t=0
+        top2_c=0
+        tek_c=0; tek_t=0
+        banko_c=0; banko_t=0
+        kaos_c=0; kaos_t=0
+        brier_sum=0.0; brier_n=0
+        draw_n=0
+        for m in matches:
+            actual_raw = m.get("actual", "")
+            actual = _FTR_MAP_A.get(actual_raw, actual_raw)
+            pred   = str(m.get("pred", "")).strip()
+            if not actual: continue
+            kupon_t += 1
+            if actual in pred: kupon_c += 1
+            if actual == "X": draw_n += 1
+            if len(pred) == 1 and "BANKO" in str(m.get("pred_label", "")):
+                banko_t += 1
+                if actual in pred: banko_c += 1
+            elif len(pred) == 3:
+                kaos_t += 1
+                if actual in pred: kaos_c += 1
+            p1 = m.get("P1", 0); px = m.get("PX", 0); p2 = m.get("P2", 0)
+            if p1 and px and p2:
+                argmax_t += 1
+                argmax = ("1" if p1 >= px and p1 >= p2 else
+                          ("X" if px >= p2 else "2"))
+                if argmax == actual: argmax_c += 1
+                probs = sorted([("1", p1), ("X", px), ("2", p2)],
+                               key=lambda x: -x[1])
+                if actual in [probs[0][0], probs[1][0]]: top2_c += 1
+                _raw = p1 + px + p2
+                if _raw > 0:
+                    pv = {"1": p1/_raw, "X": px/_raw, "2": p2/_raw}
+                    yv = {"1": 0, "X": 0, "2": 0}; yv[actual] = 1
+                    brier_sum += sum((pv[k]-yv[k])**2 for k in ["1","X","2"]) / 3.0
+                    brier_n += 1
+            if len(pred) == 1:
+                tek_t += 1
+                if pred == actual: tek_c += 1
+        return {
+            "kupon_c": kupon_c, "kupon_t": kupon_t,
+            "argmax_c": argmax_c, "argmax_t": argmax_t,
+            "top2_c": top2_c,
+            "tek_c": tek_c, "tek_t": tek_t,
+            "banko_c": banko_c, "banko_t": banko_t,
+            "kaos_c": kaos_c,   "kaos_t": kaos_t,
+            "brier": round(brier_sum/brier_n, 4) if brier_n else None,
+            "draw_n": draw_n,
+        }
+
+    def _pct(c, t):
+        if not t: return "  —  "
+        return f"{c/t*100:.1f}%"
+
+    def _wk_sort_key(item):
+        wid = item[0] if isinstance(item, tuple) else item
+        wm = _re_a.match(r'ST(\d+)-(\d+)', wid)
+        return (int(wm.group(2)), int(wm.group(1))) if wm else (0, 0)
+
+    preds = _load_preds()
+    if not preds:
+        print("  ✗ st_predictions.json bulunamadi")
+        return
+
+    weeks_data = {}
+    for wid, wd in sorted(preds.items(), key=_wk_sort_key):
+        matches = wd.get("matches", [])
+        entered = [m for m in matches if m.get("actual")]
+        if not entered: continue
+        weeks_data[wid] = _week_metrics(entered)
+
+    if not weeks_data:
+        print("  ✗ Sonuc girilmis hafta yok")
+        return
+
+    print("\n" + "═"*70)
+    print("  AUGUR ENGINE — PERFORMANS ANALIZİ")
+    print("═"*70)
+    print("""
+  METRİK ACIKLAMALARI:
+  ┌─────────────────┬────────────────────────────────────────────────┐
+  │ Kupon Kapsama   │ actual ∈ pred  (1X2, 2X, 1X gibi)             │
+  │ Saf Argmax      │ argmax(P1,PX,P2) == actual  (tek karar)       │
+  │ Top-2 Hit       │ actual ∈ top-2 olasilik  (kupon hedef metrik) │
+  │ Pure TEK Hit    │ sadece TEK onerilen maclar  (banko guveni)    │
+  └─────────────────┴────────────────────────────────────────────────┘
+  NOT: "%73 mu %57 mi?" → farkli metrikler, ikisi de dogru.
+""")
+
+    print(f"  {'HAFTA':<12} {'KUPON':>7} {'ARGMAX':>7} {'TOP-2':>7} "
+          f"{'TEK':>7} {'BANKO':>8} {'KAOS':>7} {'BRIER':>7}")
+    print("  " + "─"*67)
+
+    totals = {k: 0 for k in
+              ["kupon_c","kupon_t","argmax_c","argmax_t","top2_c",
+               "tek_c","tek_t","banko_c","banko_t","kaos_c","kaos_t"]}
+    brier_list = []
+
+    for wid, w in sorted(weeks_data.items(), key=_wk_sort_key):
+        for k in totals:
+            totals[k] += w[k]
+        if w["brier"]: brier_list.append(w["brier"])
+        print(f"  {wid:<12} "
+              f"{_pct(w['kupon_c'],  w['kupon_t']):>7} "
+              f"{_pct(w['argmax_c'], w['argmax_t']):>7} "
+              f"{_pct(w['top2_c'],   w['argmax_t']):>7} "
+              f"{_pct(w['tek_c'],    w['tek_t']):>7} "
+              f"{_pct(w['banko_c'],  w['banko_t']):>8} "
+              f"{_pct(w['kaos_c'],   w['kaos_t']):>7} "
+              f"{str(w['brier']) if w['brier'] else '  —  ':>7}")
+
+    print("  " + "─"*67)
+    avg_brier = round(sum(brier_list)/len(brier_list), 4) if brier_list else None
+    print(f"  {'TOPLAM':<12} "
+          f"{_pct(totals['kupon_c'],  totals['kupon_t']):>7} "
+          f"{_pct(totals['argmax_c'], totals['argmax_t']):>7} "
+          f"{_pct(totals['top2_c'],   totals['argmax_t']):>7} "
+          f"{_pct(totals['tek_c'],    totals['tek_t']):>7} "
+          f"{_pct(totals['banko_c'],  totals['banko_t']):>8} "
+          f"{_pct(totals['kaos_c'],   totals['kaos_t']):>7} "
+          f"{str(avg_brier) if avg_brier else '  —  ':>7}")
+
+    if avg_brier:
+        grade = ("✅ Mukemmel" if avg_brier < 0.19 else
+                 "✅ Iyi"      if avg_brier < 0.22 else
+                 "⚠ Orta"     if avg_brier < 0.26 else "❌ Zayif")
+        print(f"\n  Ortalama Brier: {avg_brier}  {grade}")
+        print("  (Standart Brier/3: Muk<0.19 | Iyi<0.22 | Orta<0.26)")
+        print("  (Referans: Pinnacle~0.190 | Rastgele~0.222 | Naive~0.250)")
+
+    banko_err = (1 - totals['banko_c']/totals['banko_t'])*100 if totals['banko_t'] else 0
+    kaos_draw = 0; kaos_draw_t = 0
+    for _, wd in preds.items():
+        for m in wd.get("matches", []):
+            pred = str(m.get("pred", "")).strip()
+            actual = _FTR_MAP_A.get(m.get("actual", ""), m.get("actual", ""))
+            if len(pred) == 3 and actual:
+                kaos_draw_t += 1
+                if actual == "X": kaos_draw += 1
+
+    print(f"""
+  ── Hata Desenleri ──────────────────────────────────
+  BANKO yanilma        : %{banko_err:.1f}  ({totals['banko_t']-totals['banko_c']}/{totals['banko_t']})
+  KAOS→X gercek berab. : %{kaos_draw/kaos_draw_t*100:.1f if kaos_draw_t else 0:.1f}  ({kaos_draw}/{kaos_draw_t})
+  ────────────────────────────────────────────────────""")
+
+    kap = totals['kupon_c']/totals['kupon_t']*100 if totals['kupon_t'] else 0
+    am  = totals['argmax_c']/totals['argmax_t']*100 if totals['argmax_t'] else 0
+    t2  = totals['top2_c']/totals['argmax_t']*100 if totals['argmax_t'] else 0
+
+    print(f"""
+  ── Metrik Yorumu ───────────────────────────────────
+  Kupon kapsama %{kap:.1f}  : 1X2/2X/1X secimler icin kapsama
+  Saf argmax    %{am:.1f}  : Model tek karar verseydi basarisi
+  Top-2 hit     %{t2:.1f}  : Gercek tahmin kalitesi (kupon hedef)
+
+  Top-2 %{t2:.0f} → Kuponlarda %80+ dogru mac iceriyor ✅
+  Argmax %{am:.0f} → Model birinci tercihi dogru %{am:.0f} oraninda
+  Gap (%{kap:.0f}-%{am:.0f}=%{kap-am:.0f}) → Cift/uclu secimlerin katkisi
+  ────────────────────────────────────────────────────""")
+
+    print("\n" + "═"*70 + "\n")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1495,6 +1681,8 @@ def main():
             _spec.loader.exec_module(_mod)
             if hasattr(_mod, "main"):
                 _mod.main()
+        else:
+            _analiz_main()
         return
     if opts["sel"] == "B":
         _run_ml_training(mem)
