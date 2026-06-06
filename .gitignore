@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Ortam
+.env
+.venv/
+venv/
+env/
+
+# ML modeller (büyük binary)
+*.pkl
+*.joblib
+*.h5
+*.pt
+
+# Kullanıcı verisi / JSON state
+st_memory.json
+st_memory_backup.json
+st_predictions.json
+st_arsiv.xlsx
+
+# İndirilen veri
+sportoto_data/
+training/
+fd_cache/
+analysis/
+coupon/
+
+# Üretilen dosyalar
+tools/elo_history.json
+tools/spor_toto_stats.json
+tools/team_strengths.json
+
+# IDE / OS
+.idea/
+.vscode/
+*.DS_Store
+*.swp
