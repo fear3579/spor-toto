@@ -36,5 +36,9 @@ tools/team_strengths.json
 # IDE / OS
 .idea/
 .vscode/
+.claude/
 *.DS_Store
 *.swp
+
+# Runtime state
+st_memory_daily.json
