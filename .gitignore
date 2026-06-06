@@ -27,8 +27,6 @@ st_arsiv.xlsx
 sportoto_data/
 training/
 fd_cache/
-analysis/
-coupon/
 
 # Üretilen dosyalar
 tools/elo_history.json
